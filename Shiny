@@ -1,0 +1,623 @@
+#Let's make a dashboard
+
+#Setup
+cat("\f")
+rm(list = ls())
+options(warn=-1)
+
+#Installing required Package
+
+plist <- c("parallel", "foreach", "doParallel", "doSNOW", "doRNG", "tictoc", 
+           "readxl", "xts", "zoo", "lubridate", "tidyverse", "ggplot2", "dplyr",
+           "strucchange", "tseries", "fUnitRoots", "timeSeries", "exuber", 
+           "urca", "vars", "rmgarch", "FinTS", "shiny", "forecast", "ftsa", 
+           "tsDyn", "rstudioapi")
+npackage <- plist[!(plist %in% installed.packages()[,"Package"])]
+if(length(npackage)>0) {install.packages(npackage)}
+
+env <- c("plist", "npackage", "env")
+remove(list = c(env))
+
+
+#Package - Parallel Computing
+library(parallel)
+library(foreach)
+library(doParallel)
+library(doSNOW)
+library(doRNG)
+library(tictoc)
+
+#Packages - Data import and Manipulation
+library(readxl)#To import data set
+library(xts) #To create Time series Data Frames
+library(zoo) #To create Time series Data Frames
+library(lubridate)#Manipulating Dates
+library(tidyverse) 
+
+#Package - Plotting
+library(ggplot2)#To create Plots
+library(dplyr)#To create overlapping plots
+
+#Package - Identifying Structural Breaks
+library(strucchange) # To Identify Structural Breaks
+
+#Package - Unit Root Test
+library(tseries)
+library(fUnitRoots)
+library(timeSeries)
+library(exuber)
+library(urca)
+
+#Package - VAR and VECM Models
+library(vars)
+
+#Package - GARCH Model
+library(rmgarch)
+library(FinTS)
+
+#Package - Dashboard
+library(shiny)
+
+#Package Miscellaneous 
+library(forecast)
+library(ftsa)
+library(tsDyn)
+library(rstudioapi)
+
+ 
+#Custom Setup and function
+cores<- detectCores()
+`%ni%` <- Negate(`%in%`)
+
+#Setup - Working Directory
+setwd(dirname(getActiveDocumentContext()$path)) #Sets it to file location
+
+
+
+#--------------DATA IMPORT AND INITIAL MANIPULATION-----------------------------    
+    
+    #Import the data
+    numeric <- rep("numeric", 505)
+    SData <- read_excel("D:/Datasets/Project/Cointegration - S&P/Cointegration with S&P.xlsx", 
+                     col_types = c("date", numeric))
+    
+    #Convert to weekly series
+    Dates <- SData$Dates
+    SData$day <- weekdays(SData$Dates)
+    Monday <- "Monday"
+    SPweekly <- subset(SData, day %in% Monday)
+    SPweekly <- SPweekly[,-507] #remove the days
+
+    #Reformatting Dates
+    Dates <- SPweekly$Dates
+    
+    #Number of observation for each Stock
+    nobs <- matrix(rep(0), 505, 1)
+    nobs <- as.data.frame(nobs)
+    for (i in 2:ncol(SPweekly)) {
+        nobs[(i-1),1] <- nrow(na.omit(SPweekly[,(i)]))
+    }
+    rownames(nobs) <- colnames(SPweekly[-1])
+    
+    #Stocks with less than 156 Observations
+    remove <- subset(nobs, nobs<156)
+    rstock <- rownames(remove)
+    SPweekly <- subset(SPweekly, select = colnames(SPweekly) %ni% rstock)
+    
+    #Stock Names
+    SSym <- colnames(SPweekly)[-1]
+    SSym <- substr(SSym, 1, nchar(SSym)-10)
+    colnames(SPweekly)[-1] <- SSym
+    SPweekly <- SPweekly[,-1]
+    Sym <- "A" #Initializing
+    
+    env <- c("numeric", "Monday", "SData","remove", "i","rstock","nobs", "env")
+    remove(list=c(env))
+    
+#-------------------------------------------------------------------------------    
+#--------------------GLOBAL ENVIRONMENT-----------------------------------------
+#-------------------------------------------------------------------------------
+
+#---------------STRUCTURAL BREAKS-----------------------------------------------    
+
+CPU <- makeCluster(cores[1]-2)
+registerDoParallel(CPU)
+Breakpoints <- foreach (i = 1:ncol(SPweekly),.packages = c("strucchange"),.combine = rbind) %dopar% {
+ts <- ts(SPweekly[,(i)], start = c(2000, 1), frequency=52)
+bp.ts <- breakpoints(ts~1)
+bp.ts$breakpoints
+}
+stopCluster(CPU)
+    
+Breakpoints <- as.data.frame(Breakpoints)
+colnames(Breakpoints) <- c("BP1", "BP2", "BP3", "BP4", "BP5")
+rownames(Breakpoints) <- colnames(SPweekly)
+
+first<-matrix(rep(0), ncol(SPweekly),1 )
+first <- as.data.frame(first)
+colnames(first) <- "First Observation"
+
+for (i in 1:ncol(SPweekly)){
+    first[i,1] <- min(which(!is.na((SPweekly)[,i])))
+}
+
+for (i in 1:ncol(SPweekly)) {
+    fvalue <- first[i,1]
+    for (a in 1:ncol(Breakpoints)){
+        Breakpoints[i,a] <- Breakpoints[i,a]+fvalue
+        }
+}
+    
+for (i in 1:length(SSym)) {
+    Breakpoints[i,6] <- length(unique(c(Breakpoints[i,-6]))) 
+}
+
+colnames(Breakpoints)[6] <- "Number of Breakpoints"
+    
+Breakpoints <- Breakpoints %>% relocate(`Number of Breakpoints`, .before = BP1)
+    
+for (i in 1:length(SSym)){
+    a <- Breakpoints$`Number of Breakpoints`[i]
+    for (b in 1:6)
+    if((b-1)>a){
+    Breakpoints[i,b] = ""
+    }
+}
+
+Breakpoints$BP1 <- as.numeric(Breakpoints$BP1)
+Breakpoints$BP2 <- as.numeric(Breakpoints$BP2)
+Breakpoints$BP3 <- as.numeric(Breakpoints$BP3)
+Breakpoints$BP4 <- as.numeric(Breakpoints$BP4)
+Breakpoints$BP5 <- as.numeric(Breakpoints$BP5)
+
+env <- c("first", "a", "b", "fvalue", "i", "env")
+remove(list = c(env))
+
+#---------------ADF TEST--------------------------------------------------------
+
+adf <- matrix(0, ncol(SPweekly), 3)
+adf <- as.data.frame(adf)
+colnames(adf) <- c("Stationary", "Unit Root", "Explosive")
+rownames(adf) <- colnames(SPweekly)
+
+Tsdata <- xts(SPweekly, order.by = Dates)
+
+for(i in 1:ncol(Tsdata)) {
+    S <- colnames(Tsdata)[i]
+    bp <- Breakpoints[S,]
+    n <- bp$`Number of Breakpoints`
+    bp <- bp[,(n+1)]
+    bp <- as.numeric(bp)
+    bp <- bp+12 #include cooling period
+    adfsta <- adf.test(na.omit(Tsdata[((bp):nrow(Tsdata)),i]))
+    adf[i,1] <- adfsta$p.value
+    adf[i,1] <- ifelse(adf[i,1]<.05, "Yes", "No")
+    adfexp <- adf.test(na.omit(Tsdata[,i]), alternative = c("explosive"))
+    adf[i,3] <- adfexp$p.value
+    adf[i,3] <- ifelse(adf[i,3]<.05, "Yes", "No")
+    adf[i,2] <- ifelse((adf[i,1]=="No"& adf[i,3]=="No"), "Yes", "No")
+}
+
+Useries <- which(adf$`Unit Root`=="Yes")
+Useries <- as.data.frame(Useries)
+
+for (i in 1:nrow(Useries)) {
+    locate <- Useries[i,1]
+    locate <- as.numeric(locate)
+    Useries[i,1] <- rownames(adf)[locate]
+}
+
+#----------------------------------
+#----------------------------------
+
+Eseries <- which(adf$`Explosive`=="Yes")
+Eseries <- as.data.frame(Eseries)
+
+for (i in 1:nrow(Eseries)) {
+    locate <- Eseries[i,1]
+    locate <- as.numeric(locate)
+    Eseries[i,1] <- rownames(adf)[locate]
+}
+
+Stseries <- which(adf$`Stationary`=="Yes")
+Stseries <- as.data.frame(Stseries)
+
+for (i in 1:nrow(Stseries)) {
+    locate <- Stseries[i,1]
+    locate <- as.numeric(locate)
+    Stseries[i,1] <- rownames(adf)[locate]
+}
+
+env <- c("Tsdata", "adfsta", "adfexp", "i", "locate", "adf", "bp", "S","n", "env")
+remove(list = (env))
+
+
+#Testing I(1)
+
+adf1 <- matrix(0, nrow(Useries), 3)
+adf1 <- as.data.frame(adf1)
+colnames(adf1) <- c("Stationary", "Unit Root", "Explosive")
+rownames(adf1) <- Useries$Useries
+
+SPU <- SPweekly[,colnames(SPweekly) %in% Useries$Useries]
+
+Tsdata <- xts(SPU, order.by = Dates)
+Tsdata <- diff(Tsdata)
+Tsdata <- xts(Tsdata, order.by = Dates)
+
+
+for(i in 1:ncol(Tsdata)) {
+    S <- colnames(Tsdata)[i]
+    bp <- Breakpoints[S,]
+    n <- bp$`Number of Breakpoints`
+    bp <- bp[,(n+1)]
+    bp <- as.numeric(bp)
+    bp <- bp+12 #include cooling period
+    adfsta <- adf.test(na.omit(Tsdata[((bp):nrow(Tsdata)),i]))
+    adf1[i,1] <- adfsta$p.value
+    adf1[i,1] <- ifelse(adf1[i,1]<.05, "Yes", "No")
+    adfexp <- adf.test(na.omit(Tsdata[,i]), alternative = c("explosive"))
+    adf1[i,3] <- adfexp$p.value
+    adf1[i,3] <- ifelse(adf1[i,3]<.05, "Yes", "No")
+    adf1[i,2] <- ifelse((adf1[i,1]=="No"& adf1[i,3]=="No"), "Yes", "No")
+}
+
+#Removing Series that are not I(1) from the Unit Root Stocks
+
+noni1 <- subset(adf1, adf1$Stationary=="No")
+noni1 <- rownames(noni1)
+Useries <- Useries[!Useries$Useries %in% noni1,]
+Useries <- as.data.frame(Useries)
+
+#----------------------------------
+#----------------------------------
+
+adf1 <- matrix(0, nrow(Eseries), 3)
+adf1 <- as.data.frame(adf1)
+colnames(adf1) <- c("Stationary", "Unit Root", "Explosive")
+rownames(adf1) <- Eseries$Eseries
+
+SPE <- SPweekly[,colnames(SPweekly) %in% Eseries$Eseries]
+
+Tsdata <- xts(SPE, order.by = Dates)
+Tsdata <- diff(Tsdata)
+Tsdata <- xts(Tsdata, order.by = Dates)
+
+for(i in 1:ncol(Tsdata)) {
+    S <- colnames(Tsdata)[i]
+    bp <- Breakpoints[S,]
+    n <- bp$`Number of Breakpoints`
+    bp <- bp[,(n+1)]
+    bp <- as.numeric(bp)
+    bp <- bp+12 #include cooling period
+    adfsta <- adf.test(na.omit(Tsdata[((bp):nrow(Tsdata)),i]))
+    adf1[i,1] <- adfsta$p.value
+    adf1[i,1] <- ifelse(adf1[i,1]<.05, "Yes", "No")
+    adfexp <- adf.test(na.omit(Tsdata[,i]), alternative = c("explosive"))
+    adf1[i,3] <- adfexp$p.value
+    adf1[i,3] <- ifelse(adf1[i,3]<.05, "Yes", "No")
+    adf1[i,2] <- ifelse((adf1[i,1]=="No"& adf1[i,3]=="No"), "Yes", "No")
+}
+
+#Removing Series that are not I(1) from the Unit Root Stocks
+noni1 <- subset(adf1, adf1$Stationary=="No")
+noni1 <- rownames(noni1)
+Eseries <- Eseries[!Eseries$Eseries %in% noni1,]
+Eseries <- as.data.frame(Eseries)
+
+env <- c("SPE", "SPU", "noni1", "Tsdata", "adfsta", "adfexp", "i", "locate", "adf1", "bp", "S","n", "env")
+remove(list = (env))
+
+
+#------------JOHANSEN TEST FOR COINTEGRATING RELATIONSHIP-----------------------
+
+Jou <- matrix(rep(0), (nrow(Useries)-1),(nrow(Useries)-1))
+rownames(Jou) <- Useries$Useries[-1]  
+colnames(Jou) <- Useries$Useries[-(nrow(Useries))]  
+Jou <- as.data.frame(Jou)  
+
+CPU <- makeCluster(cores[1]-2)
+registerDoParallel(CPU)
+Jouraw <- foreach (a = 1:(nrow(Useries)-1),.packages = c("urca", "vars", "parallel", "foreach", "doParallel"),.combine = rbind) %dopar% {
+    Bstock    <- (Useries$Useries)[a]
+    stockleft = nrow(Useries)-a
+    foreach (i = (1:(stockleft)),.packages = c("urca", "vars"),.combine = rbind) %dopar% { 
+        pairedstock <- a + i
+        tstock <- Useries$Useries[pairedstock]
+        Stocknames <- c(Bstock, tstock)
+        bp <- Breakpoints[Stocknames,]
+        nbs <- bp[Bstock, 1]
+        bpbs <- Breakpoints[Bstock, nbs]
+        nps <- bp[tstock,1]
+        bpps <- Breakpoints[tstock, nps]
+        bp <- max(bpbs,bpps)
+        bp <- bp+12
+        stockseries <- SPweekly[(bp:nrow(SPweekly)),Stocknames]
+        lag <- (VARselect(stockseries))$selection
+        lag <- min(lag)
+        lag <- max(lag, 2)
+        Jotr <- ca.jo(stockseries, type = "trace", ecdet ="const", K=lag)
+        tvalue <- Jotr@teststat
+        tvalue <- as.data.frame(tvalue)
+        cval <- Jotr@cval
+        cval <- as.data.frame(cval)
+        j = a+(i-1)
+        Jou[j,a] <- ifelse(tvalue[1,1]<cval[1,2], "No", "Yes")
+        return(c(j,a,Jou[j,a]))
+    }
+}
+stopCluster(CPU)
+
+Jouraw <- as.data.frame(Jouraw)
+Jouraw$V1 <- as.numeric(Jouraw$V1)
+Jouraw$V2 <- as.numeric(Jouraw$V2)
+
+for (i in 1:nrow(Jouraw)){
+    a <- Jouraw$V1[i]
+    b <- Jouraw$V2[i]
+    c <- Jouraw$V3[i]
+    Jou[a,b] <- c
+}
+#----------------------
+#----------------------
+
+Joe <- matrix(rep(0), (nrow(Eseries)-1),(nrow(Eseries)-1))
+rownames(Joe) <- Eseries$Eseries[-1]  
+colnames(Joe) <- Eseries$Eseries[-(nrow(Eseries))]  
+Joe <- as.data.frame(Joe)  
+
+CPU <- makeCluster(cores[1]-2)
+registerDoParallel(CPU)
+Joeraw <- foreach (a = 1:(nrow(Eseries)-1),.packages = c("urca", "vars", "parallel", "foreach", "doParallel"),.combine = rbind) %dopar% {
+    Bstock    <- (Eseries$Eseries)[a]
+    stockleft = nrow(Eseries)-a
+    foreach (i = (1:(stockleft)),.packages = c("urca", "vars"),.combine = rbind) %dopar% { 
+        pairedstock <- a + i
+        tstock <- Eseries$Eseries[pairedstock]
+        Stocknames <- c(Bstock, tstock)
+        bp <- Breakpoints[Stocknames,]
+        nbs <- bp[Bstock, 1]
+        bpbs <- Breakpoints[Bstock, nbs]
+        nps <- bp[tstock,1]
+        bpps <- Breakpoints[tstock, nps]
+        bp <- max(bpbs,bpps)
+        bp <- bp+12
+        stockseries <- SPweekly[(bp:nrow(SPweekly)),Stocknames]
+        lag <- (VARselect(stockseries))$selection
+        lag <- min(lag)
+        lag <- max(lag, 2)
+        Jotr <- ca.jo(stockseries, type = "trace", ecdet ="const", K=lag)
+        tvalue <- Jotr@teststat
+        tvalue <- as.data.frame(tvalue)
+        cval <- Jotr@cval
+        cval <- as.data.frame(cval)
+        j = a+(i-1)
+        Joe[j,a] <- ifelse(tvalue[1,1]<cval[1,2], "No", "Yes")
+        return(c(j,a,Joe[j,a]))
+    }
+}
+stopCluster(CPU)
+
+Joeraw <- as.data.frame(Joeraw)
+Joeraw$V1 <- as.numeric(Joeraw$V1)
+Joeraw$V2 <- as.numeric(Joeraw$V2)
+
+for (i in 1:nrow(Joeraw)){
+    a <- Joeraw$V1[i]
+    b <- Joeraw$V2[i]
+    c <- Joeraw$V3[i]
+    Joe[a,b] <- c
+}
+
+
+
+#-------------------------------------------------------------------------------    
+#----------------USER INTERFACE-------------------------------------------------
+#-------------------------------------------------------------------------------
+
+#User Interface
+ui <- shinyUI(
+    navbarPage("Cointegrated Stocks",
+        tabPanel("Base Stock",
+            # Sidebar with a dropdown input for stock names 
+            sidebarLayout(
+                sidebarPanel(
+                    selectInput("Stock_Sym",
+                                "Stock Symbol",
+                                "A"),
+                    dataTableOutput("Breakpoint") #Output Breakpoints
+                            ),
+            mainPanel(
+                plotOutput("Stock Price"), #Output Plot
+                verbatimTextOutput("Unit Root"), #Output Unitroot
+                verbatimTextOutput("Possible Pairs") #Cointegrated Pairs
+                     )
+            )
+        ),  
+        tabPanel("Pair Stability and Diagnostics",
+                 #Sidebar with a dropdown input for the pair stocks
+                 sidebarLayout(
+                     sidebarPanel(
+                         selectInput("Pair_Sym",
+                                     "Stock Symbol",
+                                     "A"),
+                            ),
+                    mainPanel(
+                        plotOutput("Pair Plot"), #Plot over all price
+                        #plotOutput("Pair Scatter") #Scatter plot of the price
+                            )
+                         )
+                 )
+    )
+)
+
+#-------------------------------------------------------------------------------    
+#----------------SERVER LOGIC---------------------------------------------------
+#-------------------------------------------------------------------------------
+
+server <- function(input, output, session) {
+
+#-------------------------------------------------------------------------------   
+#----------------PAGE 1---------------------------------------------------------
+#-------------------------------------------------------------------------------    
+    
+#--------------------STOCK SELECTION--------------------------------------------    
+
+    #Input - Stock Selection
+    observe({
+        updateSelectInput(session, "Stock_Sym" , choices = as.data.frame(SSym))
+    })
+    
+#-----------------------PRICE PLOT-----------PAGE 1-----------------------------
+    
+    #Process - Stock Series + Dates
+    SSeries <- reactive({
+        req(input$Stock_Sym)
+        Sym <- input$Stock_Sym
+        df <- SPweekly[,Sym]
+        colnames(df)[1] <- "Price"
+        df <- cbind(df,Dates)
+    })
+    
+    #Plot
+    Priceplot <- reactive({
+        ggplot(SSeries(), mapping = aes(x=Dates, y=Price))+geom_line()
+    })
+    
+    #Output - Plot
+    output$`Stock Price` <- renderPlot({
+        Priceplot <- Priceplot()
+        Priceplot
+    })
+    
+#----------------------STRUCTURAL BREAK--------PAGE 1---------------------------    
+    
+    #Data for Structural Break
+    BPSeries <- reactive({
+        req(input$Stock_Sym)
+        Sym <- input$Stock_Sym
+        df <- Breakpoints[Sym,(-1)]
+        df <- as.data.frame(df)
+        df <- t(df)
+        
+    })
+    
+    #Output - Structural Breaks
+    output$`Breakpoint` <- renderDataTable({
+        Breakpoints <- BPSeries()
+        Breakpoints
+        }, options = list(dom = 't'))
+
+#----------------UNIT ROOT TEST--------------PAGE 1-----------------------------
+    
+    #ADF Test
+    ADF <- reactive({
+        req(input$Stock_Sym)
+        Sym <- input$Stock_Sym
+        if (Sym %in% Stseries){
+            Statement <- "The stock has a Stationary Root after last Structural Break"
+        } else if (Sym %in% Eseries$Eseries){
+            Statement <- "The stock has an Explosive Root after last Structural Break"
+        } else if (Sym %in% Useries$Useries){
+            Statement <- "The stock has a Unit Root after last Structural Break"
+        } else {
+            Statement <- "The stock do not have enough Observation"
+        }
+    })
+
+    #Output - Existence of Unit Roots/Explosive Root
+    output$`Unit Root` <- renderPrint({
+        ADF <- ADF()
+        ADF
+    })
+    
+#-----TESTING FOR COINTEGRATING RELATIONSHIP-----PAGE 1-------------------------
+    
+    Coin <- reactive({
+        req(input$Stock_Sym)
+        Sym <- input$Stock_Sym
+        remove(Row)
+        remove(Col)
+        if (Sym %in% Stseries$Stseries) {
+            print("The Stock is stationary and cannot have cointegrating relationship")
+        } else if (Sym %in% Useries$Useries) {
+            Row <- as.data.frame(Jou[,Sym])
+            rownames(Row) <- rownames(Jou)
+            Col <- as.data.frame(Jou[Sym,])
+            Col <- as.data.frame(t(Col))
+            rownames(Col) <- colnames(Jou)
+            CopairsR <- rownames(Row)[Row[,1]=="Yes"]
+            CopairsC <- rownames(Col)[Col[,1]=="Yes"]
+            CopairsU <- c(unique(CopairsR, CopairsC))
+            CopairsU <- ifelse(length(CopairsU)==0, print("The Stock is not cointegrated with any other stock"), print(CopairsU))
+        } else if (Sym %in% Eseries$Eseries) {
+            Row <- as.data.frame(Joe[,Sym])
+            rownames(Row) <- rownames(Joe)
+            Col <- as.data.frame(Joe[Sym,])
+            Col <- as.data.frame(t(Col))
+            rownames(Col) <- colnames(Joe)
+            CopairsR <- rownames(Row)[Row[,1]=="Yes"]
+            CopairsC <- rownames(Col)[Col[,1]=="Yes"]
+            CopairsE <- c(CopairsR, CopairsC)
+            CopairsE <- unique(CopairsE)
+            CopairsE <- ifelse(length(CopairsE)==0, print("The Stock is not cointegrated with any other stock"), print(CopairsE))
+        }   else {
+            print("The stock either do not have enough Observation or is not I(1)")
+        }
+    })
+    
+    output$`Possible Pairs` <- renderPrint({
+        Coin <- Coin()
+    })
+    
+#-------------------------------------------------------------------------------
+#------------PAGE 2-------------------------------------------------------------
+#-------------------------------------------------------------------------------    
+
+#------------PAIR SELECTION--------------------PAGE 2---------------------------
+    
+    #Input - Pair Selection
+    
+        observe({
+        updateSelectInput(session, "Pair_Sym" , choices = as.data.frame(Coin()))
+    })
+    
+    
+    
+#------------PRICE PLOT WITH THE PAIRS---------PAGE 2---------------------------
+    #Process - Stock Series + Dates
+    PSeries <- reactive({
+        req(input$Stock_Sym)
+        req(input$Pair_Sym)
+        Sym <- input$Stock_Sym
+        PSym <- input$Pair_Sym
+        Stock <- c(Sym, PSym)
+        df <- SPweekly[,c(Stock)]
+        colnames(df) <- c(Stock)
+        df <- cbind(df,Dates)
+    })
+    
+    #Plot
+    `Pair plot` <- reactive({
+        ts <- xts(PSeries(), order.by = Dates)
+        plot(ts)
+    })
+    
+    #Output - Plot
+    output$`Pair plot` <- renderPlot({
+        Pairplot <- `Pair plot`()
+        Pairplot
+    })
+    
+#------------PRICE PLOT WITH THE PAIRS--------- PAGE 2--------------------------
+    
+    #Plot
+    `Scatter Pair` <- reactive({
+        
+    })
+    
+    
+}#Close Server
+
+# Run the application 
+shinyApp(ui = ui, server = server)
